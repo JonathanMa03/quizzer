@@ -178,28 +178,50 @@ Do not commit `.env` to version control.
 
 ## Running Quizzer
 
-Once installed, Quizzer should be runnable using a single terminal command.
-```
-gen_quizzes --input ./inputs --N 4 --M 10 --T multiple
+Once installed, Quizzer is runnable from the command line.
+
+```bash
+gen_quizzes --input ./inputs --output ./outputs --N 4 --M 10 --T mixed --format markdown
 ```
 
 Where:
 
 * `--input` is the path to the course input directory
+* `--output` is the destination folder for generated files
 * `--N` is the number of quiz versions to generate
 * `--M` is the number of questions per quiz
-* `--T` is the type of question, `multiple` for multiple choice/select all, `open` for open-ended
+* `--T` is `mixed` for a planned mix of multiple-choice and multiple-select questions, or `open` for open-ended questions
+* `--format` chooses the output format for quiz and answer-key files: `markdown` or `tex`
+* `--topic` optionally limits generation to a subject phrase, such as `--topic "introductions and distributions"`
 
-Example:
+Example with a topic filter:
+
+```bash
+gen_quizzes --input ./inputs --output ./outputs --N 3 --M 15 --T multiple --format markdown --topic "introductions and distributions"
 ```
-gen_quizzes --input ./inputs --N 3 --M 15
+
+This generates 3 quiz versions, each with 15 questions, and writes the results to `outputs/` using Markdown output. The topic filter is a keyword-based constraint that keeps generation focused on the supplied subject matter phrase.
+
+When lecture-note filenames begin with lecture numbers, select them directly. For example, this selects lecture files beginning with `05-` and `06-`, plus matching numbered MLO files:
+
+```bash
+gen_quizzes --N 1 --M 15 --T mixed --topic 05 06
 ```
-This generates 3 quiz versions,15 questions per quiz and writes the results to  `outputs/.`  
 
 The default input directory may also be `./inputs`, allowing:
+
+```bash
+gen_quizzes --output ./outputs --N 4 --M 10 --format markdown
 ```
-gen_quizzes --N 4 --M 10
-```
+
+The generator writes:
+
+* quiz files to `outputs/quizzes/`
+* answer keys to `outputs/answer_keys/`
+* audit summaries to `outputs/audit/`
+* the shared structured plan to `outputs/audit/blueprint.json`
+* supplementary code and plot artifacts to `outputs/supplementary/`
+
 ## SKILL.md
 
 SKILL.md contains the generation and quality-control rules used by Quizzer.

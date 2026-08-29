@@ -1,0 +1,5 @@
+pypdf>=4.2.0
+python-dotenv>=1.0.1
+beautifulsoup4>=4.12.3
+markdown>=3.6
+openai>=1.0.0
