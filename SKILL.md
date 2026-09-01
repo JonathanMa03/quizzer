@@ -7,15 +7,19 @@ description: Generate grounded, comparable course quizzes and answer keys from s
 
 ## Executable Blueprint Contract
 
-Before generating question prose, create one assessment blueprint shared by all quiz versions. Each numbered slot must specify its topic, source learning outcome, question type, and difficulty. Versions may vary wording, scenarios, values, and answer ordering, but must preserve those slot-level targets.
+Before generating question prose, create a structured assessment blueprint for the run. Preserve comparable overall coverage and question-type counts, but permute topics, learning outcomes, modalities, and difficulty positions across versions. Multiple versions are alternate assessments, not paraphrases: do not reuse the same central question, scenario, code, numerical setup, plot shape, or fixed modality positions across versions.
 
 The user-facing question mode must be either `mixed` or `open`. A `mixed` quiz contains both single-answer multiple-choice and multiple-select questions; determine their distribution internally rather than asking for a multiple-select count. An `open` quiz contains only open-ended questions.
 
 Blueprint slots may assess concepts through prose, formula work, code reasoning, or plot interpretation when supported by the course materials. Use notebook-compatible dollar-sign math delimiters and prefer inline `$...$` when display math is unnecessary.
 
-Render Markdown answer choices with explicit line breaks so A, B, C, and D never collapse onto one line. A plot-interpretation question must reference an actual generated image. Save its reproducible generator under `outputs/supplementary/code/`, save the image under `outputs/supplementary/plots/`, and link the image from the quiz. Never ask students to interpret an imagined “given plot.” Normalize generated LaTeX before rendering so JSON escape sequences cannot corrupt commands such as `\bar`, `\frac`, `\nu`, or `\epsilon`; inline `$...$` math is preferred when a display block is unnecessary.
+Render Markdown answer choices with explicit line breaks so A, B, C, and D never collapse onto one line. A plot-interpretation question must reference an actual generated image. Save its reproducible generator under `outputs/supplementary/code/`, save the image under `outputs/supplementary/plots/`, and link the image from the quiz. Never ask students to interpret an imagined “given plot.” Generated assessment plots must be title-less because a title can reveal the answer. Normalize generated LaTeX before rendering so JSON escape sequences cannot corrupt commands such as `\bar`, `\frac`, `\nu`, or `\epsilon`; inline `$...$` math is preferred when a display block is unnecessary.
+
+Every question must be grounded in something a student can reason from: concrete values, a dataset, code, a formula, a displayed result, a plot, or a realistic decision scenario. Avoid abstract prompts that only ask which generic description is best. Code questions must contain a valid fenced Markdown code block with real newlines; never emit literal `\\n` sequences or a malformed one-backtick language block.
 
 Treat the emitted `outputs/audit/blueprint.json` as the authoritative run plan. If a prose rule conflicts with the user's explicit CLI arguments or the executable blueprint, follow the user arguments and report the conflict in the audit.
+
+Selected lecture notes and explicit learning outcomes jointly define assessable content. Syllabi may provide administrative context but do not authorize quiz topics. A learning outcome can authorize its named concept (for example KDE), but a broad category such as classification does not authorize an unnamed algorithm, package, class, or API. Every learning outcome in the supplied outcome file must appear at least once per quiz when the requested question count is large enough; otherwise report that the count makes complete coverage impossible. Every question must be solvable without a computer: code may be read by inspection, but must not require execution, pseudorandom output, model fitting, or unstated library behavior.
 
 ## 1. Purpose
 
@@ -319,6 +323,8 @@ A text-only description of a plot does not count as a plot-based question unless
 
 Each plot-based question must require interpretation of the plot.
 
+The generated image is the only student-facing representation of its data. Do not print raw coordinates, x/y arrays, a data table, or a `Plot Points` section in the question text.
+
 Plot-based questions must not merely ask students to identify superficial visual features such as:
 
 - the title
@@ -340,6 +346,12 @@ Plot-based questions should assess interpretation, such as:
 - scree plot implications
 - variance explained
 - relationships between plotted quantities
+
+Match the graphic to the statistical object. Use histograms for distribution shape, modes, location, dispersion, skewness, and kurtosis; use scatterplots for relationships and clustering; use line plots only when ordering or a continuous curve is meaningful.
+
+Do not place a title on an assessment plot. The prompt and axes should provide only the context needed to answer the question without naming the phenomenon being tested.
+
+When assessing clustering, use enough observations to show stable group structure: at least 30 points across at least two visibly separated groups. A tiny scatterplot or a nearly monotone cloud is not acceptable because it can be mistaken for regression. Use a reproducible group assignment in the plot specification so the generated artifact preserves the intended structure.
 
 ---
 
@@ -380,7 +392,7 @@ The script must:
 - use reproducible random seeds when randomness is involved
 - save each plot to the exact filename referenced in the quiz Markdown
 - save plot image files in the same folder as the quiz Markdown files
-- use clear axis labels and titles when appropriate
+- use clear axis labels but no plot title
 - avoid relying on external data files unless the user provides them
 - generate every image referenced by the quiz
 - avoid generating unused images unless there is a clear reason
@@ -443,6 +455,7 @@ When code appears inside a quiz question:
 - code must be short enough to read within a quiz question
 - code must not rely on unstated external files
 - code must not use triple backticks inside the quiz Markdown code block if that would prematurely close the quiz code block
+- code must render as a fenced Markdown block with real line breaks in generated quiz files; do not serialize visible `\\n` text or use a single backtick as a multiline fence
 
 Use indentation or inline code formatting inside the quiz code block when necessary.
 

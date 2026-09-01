@@ -1,6 +1,6 @@
 # Quizzer
 
-Quizzer is an LLM-assisted quiz generator for course materials. It creates one or more comparable quiz versions, separate answer keys, a shared assessment blueprint, an audit report, and reproducible plot artifacts when plot interpretation is assessed.
+Quizzer is an LLM-assisted quiz generator for course materials. It creates one or more alternate quiz versions, separate answer keys, a structured assessment blueprint, an audit report, and reproducible plot artifacts when plot interpretation is assessed.
 
 Quiz questions can assess:
 
@@ -26,7 +26,7 @@ Parse lecture notes, syllabus, and learning outcomes
     ↓
 Build one structured assessment blueprint
     ↓
-Generate comparable quiz versions in validated batches
+Generate distinct alternate quiz versions in validated batches
     ↓
 Normalize Markdown and mathematical notation
     ↓
@@ -35,7 +35,9 @@ Generate and execute plot scripts when required
 Write quizzes, answer keys, blueprint, artifacts, and audit
 ```
 
-Every quiz version uses the same blueprint slots for topic, learning outcome, question type, modality, and difficulty. The wording and scenarios can vary between versions while the assessed targets remain comparable.
+Quiz versions retain comparable overall coverage and question-type counts, but topics, learning outcomes, modalities, and difficulty positions are permuted. Earlier question stems are supplied as an exclusion list so later versions use different scenarios, code, values, plots, and central tasks.
+
+Selected lecture notes and explicit learning outcomes jointly define assessable content. Syllabus material is contextual only. When a learning-outcome file contains a `Learning Outcomes` or `Learning Objectives` section, Quizzer extracts outcomes from that section rather than treating earlier key-concept bullets as additional outcomes. Each outcome is assigned at least once per quiz; generation reports an error when the requested question count is smaller than the number of supplied outcomes.
 
 ## Project structure
 

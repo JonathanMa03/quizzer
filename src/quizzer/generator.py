@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -15,10 +16,14 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from .blueprint import (
+    LearningOutcome,
     QuizBlueprint,
     build_blueprint,
     extract_learning_outcomes,
+    normalize_code_fences,
+    normalize_choice_fields,
     normalize_formula_delimiters,
+    normalize_plot_specs,
     validate_generated_quiz,
 )
 from .input_loader import collect_input_documents
@@ -29,6 +34,412 @@ load_dotenv()
 SUPPORTED_QUESTION_TYPES = {"mixed", "open"}
 GENERATION_BATCH_SIZE = 5
 MAX_GENERATION_ATTEMPTS = 3
+
+
+def _build_safe_fallback_question(requirement: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a source-grounded conceptual question without another model call."""
+    number = requirement["number"]
+    kind = requirement["question_kind"]
+    outcome_data = requirement.get("learning_outcome") or {}
+    outcome = str(outcome_data.get("statement") or "Explain and apply the selected course concept.").strip()
+    source = outcome_data.get("source") or "selected learning outcomes"
+    lowered = outcome.casefold()
+
+    if kind == "open_ended":
+        return {
+            "number": number,
+            "question_kind": kind,
+            "modality": "conceptual",
+            "question": f"Explain this course concept in your own words and give one relevant example: {outcome}",
+            "options": None,
+            "correct_answers": [f"A complete response accurately explains and exemplifies: {outcome}"],
+            "explanation": f"The response must accurately address and exemplify this course concept: {outcome}",
+            "source_references": [source],
+            "plot_spec": None,
+            "_modality_fallback": "to_conceptual",
+        }
+
+    is_multi = kind == "multiple_select"
+    if "supervised" in lowered and "unsupervised" in lowered:
+        question = (
+            "Which examples correctly match a learning setting with its description? Select all that apply."
+            if is_multi else
+            "A researcher uses labeled examples to predict a continuous house price. How should this task be described?"
+        )
+        options = (
+            {
+                "A": "Predicting a continuous value from labeled examples is supervised regression.",
+                "B": "Grouping unlabeled observations by similarity is unsupervised clustering.",
+                "C": "Predicting a class from labeled examples is unsupervised learning.",
+                "D": "Grouping unlabeled observations is supervised regression.",
+            }
+            if is_multi else
+            {
+                "A": "Supervised learning with a continuous outcome",
+                "B": "Supervised learning with a discrete outcome",
+                "C": "Unsupervised clustering",
+                "D": "Unsupervised dimensionality reduction",
+            }
+        )
+        answers = ["A", "B"] if is_multi else ["A"]
+    elif "classification" in lowered and "regression" in lowered and "clustering" in lowered:
+        question = (
+            "Which task descriptions are correctly matched? Select all that apply."
+            if is_multi else
+            "A team groups customers by similar purchasing behavior without labeled outcomes. Which task is this?"
+        )
+        options = {
+            "A": "Classification assigns observations to predefined classes.",
+            "B": "Regression predicts a continuous outcome.",
+            "C": "Clustering requires predefined class labels.",
+            "D": "Dimensionality reduction predicts a required response variable.",
+        } if is_multi else {
+            "A": "Clustering", "B": "Regression", "C": "Classification", "D": "Dimensionality reduction"
+        }
+        answers = ["A", "B"] if is_multi else ["A"]
+    elif "kde" in lowered or ("kernel" in lowered and "bandwidth" in lowered):
+        question = (
+            "Which statements about kernel density estimation are correct? Select all that apply."
+            if is_multi else
+            "What is the primary role of bandwidth in kernel density estimation?"
+        )
+        options = {
+            "A": "KDE estimates a smooth distribution from observed data.",
+            "B": "Bandwidth controls the smoothness of the estimate.",
+            "C": "KDE assigns observations to known class labels.",
+            "D": "Bandwidth is the number of rows in the dataset.",
+        } if is_multi else {
+            "A": "It controls how smooth the estimated density is.",
+            "B": "It sets the number of observations.",
+            "C": "It chooses the response variable.",
+            "D": "It converts continuous data into class labels.",
+        }
+        answers = ["A", "B"] if is_multi else ["A"]
+    elif "underfit" in lowered or "overfit" in lowered:
+        question = (
+            "Which statements correctly describe model complexity? Select all that apply."
+            if is_multi else
+            "A model performs very well on training data but poorly on new data. Which issue is most likely?"
+        )
+        options = {
+            "A": "An overly simple model can underfit.",
+            "B": "An overly complex model can overfit training data.",
+            "C": "Greater complexity always improves performance on new data.",
+            "D": "Underfitting means memorizing every training observation.",
+        } if is_multi else {
+            "A": "Overfitting", "B": "Underfitting", "C": "Clustering", "D": "Dimensionality reduction"
+        }
+        answers = ["A", "B"] if is_multi else ["A"]
+    elif "signal" in lowered and "noise" in lowered:
+        question = "Which statement best distinguishes signal from random noise in an observation?"
+        options = {
+            "A": "Signal is the structured pattern; noise is unexplained random variation.",
+            "B": "Signal and noise are always identical.",
+            "C": "Noise is the structured pattern of interest.",
+            "D": "Signal refers only to the largest observed value.",
+        }
+        answers = ["A"]
+    elif any(term in lowered for term in ("mean", "median", "variance", "standard deviation", "skew")):
+        question = "Which statement about descriptive statistics is correct?"
+        options = {
+            "A": "The median is the middle value after observations are ordered.",
+            "B": "Variance measures the most frequent value.",
+            "C": "The mean is unaffected by extreme observations.",
+            "D": "Standard deviation measures the location of the center only.",
+        }
+        answers = ["A"]
+    elif "pandas" in lowered:
+        question = "Which task is Pandas primarily used for in the course workflow?"
+        options = {
+            "A": "Loading and manipulating tabular data",
+            "B": "Defining database server permissions",
+            "C": "Training an unspecified classification algorithm",
+            "D": "Replacing all numerical computation",
+        }
+        answers = ["A"]
+    elif "matplotlib" in lowered:
+        question = "Which task is Matplotlib primarily used for?"
+        options = {"A": "Creating data visualizations", "B": "Loading SQL tables", "C": "Computing array means", "D": "Assigning class labels"}
+        answers = ["A"]
+    else:
+        question = f"Which statement best demonstrates this course concept: {outcome}"
+        options = {
+            "A": outcome,
+            "B": "The concept applies only to course administration.",
+            "C": "The concept requires ignoring the supplied course material.",
+            "D": "The concept cannot be explained or applied.",
+        }
+        answers = ["A"]
+    if is_multi and len(answers) == 1:
+        options["B"] = "The concept should be interpreted using the definitions and examples in the selected course materials."
+        answers = ["A", "B"]
+    return {
+        "number": number,
+        "question_kind": kind,
+        "modality": "conceptual",
+        "question": question,
+        "options": options,
+        "correct_answers": answers,
+        "explanation": f"The correct choice or choices assess this course outcome: {outcome}",
+        "source_references": [source],
+        "plot_spec": None,
+        "_modality_fallback": "to_conceptual",
+    }
+
+
+def _question_similarity_errors(data: Dict[str, Any], prior_questions: List[str]) -> List[str]:
+    """Reject near-duplicate stems across alternate versions."""
+    errors: List[str] = []
+    prior = [re.sub(r"\s+", " ", text).strip().casefold() for text in prior_questions if text.strip()]
+    for question in data.get("questions", []):
+        current = re.sub(r"\s+", " ", str(question.get("question", ""))).strip().casefold()
+        if not current:
+            continue
+        for old in prior:
+            ratio = SequenceMatcher(None, current, old).ratio()
+            current_words = set(re.findall(r"[a-z0-9]+", current))
+            old_words = set(re.findall(r"[a-z0-9]+", old))
+            overlap = len(current_words & old_words) / max(1, len(current_words | old_words))
+            if ratio >= 0.72 or overlap >= 0.72:
+                errors.append(
+                    f"question {question.get('number')}: too similar to an earlier-version question"
+                )
+                break
+    return errors
+
+
+def _material_grounding_errors(data: Dict[str, Any], lecture_material: str) -> List[str]:
+    """Reject questions that require unintroduced software or computer execution."""
+    errors: List[str] = []
+    material = lecture_material.casefold()
+    named_methods = {
+        "decision tree": r"\bdecision trees?\b",
+        "support vector machine": r"\b(?:support vector machines?|svms?)\b",
+        "time series": r"\btime series\b",
+        "scikit-learn": r"\b(?:scikit-learn|sklearn)\b",
+        "seaborn": r"\bseaborn\b",
+        "k-nearest neighbors": r"\b(?:k-nearest neighbors?|knn)\b",
+        "logistic regression": r"\blogistic regression\b",
+    }
+    for question in data.get("questions", []):
+        number = question.get("number")
+        prompt = str(question.get("question", ""))
+        lowered = prompt.casefold()
+        text_values = [prompt, str(question.get("explanation", ""))]
+        if isinstance(question.get("options"), dict):
+            text_values.extend(str(value) for value in question["options"].values())
+        all_student_text = " ".join(text_values).casefold()
+        for method, pattern in named_methods.items():
+            if re.search(pattern, all_student_text, re.IGNORECASE) and not re.search(pattern, material, re.IGNORECASE):
+                errors.append(
+                    f"question {number}: method '{method}' is not introduced in the selected notes or outcomes"
+                )
+        if question.get("modality") == "code":
+            if re.search(r"\b(?:random|rand|randn|default_rng)\b", lowered):
+                errors.append(f"question {number}: code questions must not depend on random output")
+            if re.search(r"\.(?:fit|predict|score)\s*\(", prompt):
+                errors.append(f"question {number}: code questions must be solvable without fitting or running a model")
+            imported_roots = re.findall(
+                r"(?m)^\s*(?:from\s+([A-Za-z_]\w*)|import\s+([A-Za-z_]\w*))",
+                prompt,
+            )
+            for first, second in imported_roots:
+                package = (first or second).casefold()
+                if package not in material:
+                    errors.append(
+                        f"question {number}: package '{package}' is not introduced in the selected lecture notes"
+                    )
+            if re.search(r"(?i)assume\s+['\"]?data['\"]?\s+is", prompt) and not re.search(
+                r"(?m)^\s*data\s*=", prompt
+            ):
+                errors.append(f"question {number}: code question uses data without providing its values")
+        if re.search(r"(?i)\b(?:calculate|compute|determine)\b", prompt) and len(re.findall(r"[-+]?\d+(?:\.\d+)?", prompt)) > 12:
+            errors.append(f"question {number}: computation is too large to solve without a computer")
+    return errors
+
+
+def _answer_exposure_errors(data: Dict[str, Any]) -> List[str]:
+    """Reject stems that explicitly name a short correct answer."""
+    errors: List[str] = []
+    for question in data.get("questions", []):
+        prompt = re.sub(r"[`*_]", "", str(question.get("question", ""))).casefold()
+        options = question.get("options")
+        answers = question.get("correct_answers")
+        if not isinstance(options, dict) or not isinstance(answers, list):
+            continue
+        for letter in answers:
+            answer = re.sub(r"[`*_]", "", str(options.get(letter, ""))).strip().casefold()
+            words = re.findall(r"[a-z0-9]+", answer)
+            if (
+                1 <= len(words) <= 6
+                and len(answer) >= 3
+                and answer
+                and re.search(rf"\b{re.escape(answer)}\b", prompt)
+            ):
+                errors.append(
+                    f"question {question.get('number')}: prompt exposes correct answer {letter}"
+                )
+                break
+    return errors
+
+
+def _filter_outcomes_for_lecture(outcomes: List[Any], lecture_material: str) -> List[Any]:
+    """Keep MLO statements whose substantive vocabulary is present in the notes."""
+    stopwords = {
+        "about", "across", "after", "also", "appropriate", "common", "concept", "concepts",
+        "data", "describe", "distinguish", "explain", "identify", "include", "includes",
+        "into", "learning", "often", "selected", "statement", "statistics", "students",
+        "such", "their", "these", "through", "tools", "using", "while", "with", "without",
+    }
+
+    def stem(word: str) -> str:
+        for suffix in ("ing", "ed", "es", "s"):
+            if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+                return word[: -len(suffix)]
+        return word
+
+    material_tokens = {stem(token) for token in re.findall(r"[A-Za-z][A-Za-z0-9_]+", lecture_material.casefold())}
+    supported = []
+    for outcome in outcomes:
+        tokens = {
+            stem(token)
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9_]+", outcome.statement.casefold())
+            if len(token) >= 4 and token not in stopwords
+        }
+        if tokens and len(tokens & material_tokens) / len(tokens) >= 0.9:
+            supported.append(outcome)
+    return supported
+
+
+def _normalize_generated_data(data: Dict[str, Any], plan: Dict[str, Any]) -> None:
+    """Apply deterministic repairs before enforcing the generation contract."""
+    normalize_formula_delimiters(data, plan)
+    normalize_code_fences(data)
+    normalize_plot_specs(data, plan)
+    normalize_choice_fields(data, plan)
+
+
+def _repair_question_with_llm(
+    client: OpenAI,
+    requirement: Dict[str, Any],
+    invalid_question: Dict[str, Any] | None,
+    course_material: str,
+    version_num: int,
+    prior_question_prompts: List[str] | None = None,
+) -> Dict[str, Any]:
+    """Generate one focused replacement after batch-level retries are exhausted."""
+    active_requirement = dict(requirement)
+    downgraded_modality = False
+    initial_grounding_errors = _material_grounding_errors(
+        {"questions": [invalid_question]} if isinstance(invalid_question, dict) else {"questions": []},
+        course_material,
+    )
+    if active_requirement.get("modality") == "code" and initial_grounding_errors:
+        active_requirement["modality"] = "conceptual"
+        downgraded_modality = True
+        previous = "null (discard the prior computer-dependent code question entirely)"
+    else:
+        previous = json.dumps(invalid_question, ensure_ascii=False, indent=2) if invalid_question else "null"
+    single_plan = {"version": version_num, "requirements": [active_requirement]}
+    errors: List[str] = ["no valid question was produced"]
+    structurally_valid_fallback: Dict[str, Any] | None = None
+    modality_fallback: Dict[str, Any] | None = None
+
+    for _attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+        prompt = f"""Repair one quiz question so it satisfies the assessment requirement exactly.
+
+Return a JSON object containing exactly one question in a `questions` list. Use the exact number, question_kind, and modality from the requirement.
+
+For single_choice, provide exactly four non-empty options keyed A, B, C, and D, plus exactly one correct_answers letter.
+For multiple_select, provide exactly four non-empty options keyed A, B, C, and D, plus at least two correct_answers letters.
+For open_ended, omit options and provide a concise model answer in correct_answers.
+For code, put one shared executable snippet in a fenced Markdown block in the question prompt. Answer choices must be prose interpretations or outputs, never alternative code snippets. Provide every input value and use no answer-revealing comments, variable names, function names, or printed labels.
+For plot_interpretation, include plot_spec with plot_type, numeric x/y lists, empty title, axis labels, and groups when clustering is assessed. Plot questions still require A-D options when their question_kind is a choice type.
+Use only concepts and software explicitly present in the selected lecture material. The student must be able to answer without running code or using a computer; do not use random output or fitted-model behavior. Use a histogram—not a scatterplot—when asking about a distribution's shape, modes, location, dispersion, skewness, or kurtosis.
+
+REQUIREMENT:
+{json.dumps(active_requirement, ensure_ascii=False, indent=2)}
+
+INVALID QUESTION TO REPAIR:
+{previous}
+
+EARLIER-VERSION QUESTIONS THAT MUST NOT BE PARAPHRASED OR REUSED:
+{json.dumps([text[:500] for text in (prior_question_prompts or [])[-60:]], ensure_ascii=False, indent=2)}
+
+VALIDATION ERRORS FROM THE PRIOR REPAIR:
+- {'; '.join(errors)}
+
+COURSE MATERIAL:
+{course_material[:15000]}
+
+Respond only with JSON."""
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_completion_tokens=2048,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        response_text = response.choices[0].message.content or ""
+        try:
+            data = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            errors = [f"response was not valid JSON: {exc.msg}"]
+            previous = response_text[:8000]
+            continue
+
+        _normalize_generated_data(data, single_plan)
+        structural_errors = validate_generated_quiz(data, single_plan)
+        structural_errors.extend(_material_grounding_errors(data, course_material))
+        structural_errors.extend(_answer_exposure_errors(data))
+        diversity_errors = _question_similarity_errors(data, prior_question_prompts or [])
+        errors = structural_errors + diversity_errors
+        if not structural_errors:
+            structurally_valid_fallback = data["questions"][0]
+        elif (
+            len(data.get("questions", [])) == 1
+            and all("code questions require rendered code" in error for error in structural_errors)
+        ):
+            modality_fallback = data["questions"][0]
+        if not errors:
+            repaired = data["questions"][0]
+            if downgraded_modality:
+                repaired["_modality_fallback"] = "code_to_conceptual"
+            return repaired
+
+        if active_requirement.get("modality") == "code" and any(
+            "not introduced" in error
+            or "without fitting or running a model" in error
+            or "random output" in error
+            or "too large to solve without a computer" in error
+            for error in structural_errors
+        ):
+            active_requirement["modality"] = "conceptual"
+            single_plan = {"version": version_num, "requirements": [active_requirement]}
+            downgraded_modality = True
+            previous = "null (discard the prior computer-dependent code question entirely)"
+            continue
+        questions = data.get("questions")
+        previous = json.dumps(
+            questions[0] if isinstance(questions, list) and questions else data,
+            ensure_ascii=False,
+            indent=2,
+        )[:8000]
+
+    # Diversity is a bounded quality objective, not a reason to discard a
+    # structurally correct quiz after all targeted repair attempts.
+    if structurally_valid_fallback is not None and all("too similar" in error for error in errors):
+        if downgraded_modality:
+            structurally_valid_fallback["_modality_fallback"] = "code_to_conceptual"
+        return structurally_valid_fallback
+    if modality_fallback is not None and all(
+        "code questions require rendered code" in error or "too similar" in error
+        for error in errors
+    ):
+        modality_fallback["modality"] = "conceptual"
+        modality_fallback["_modality_fallback"] = "code_to_conceptual"
+        return modality_fallback
+
+    return _build_safe_fallback_question(requirement)
 
 
 def _get_client() -> OpenAI:
@@ -142,6 +553,7 @@ def _generate_quiz_with_llm(
     version_num: int,
     output_format: str,
     output_dir: Path,
+    prior_question_prompts: List[str] | None = None,
 ) -> tuple[str, str, List[str]]:
     """
     Use OpenAI to generate quiz questions and answers based on course material.
@@ -156,6 +568,8 @@ def _generate_quiz_with_llm(
     requirements = plan["requirements"]
     generated_questions: List[Dict[str, Any]] = []
     client = _get_client()
+    prior_question_prompts = prior_question_prompts if prior_question_prompts is not None else []
+    avoidance_list = [prompt[:500] for prompt in prior_question_prompts[-60:]]
 
     for batch_start in range(0, len(requirements), GENERATION_BATCH_SIZE):
         batch_requirements = requirements[batch_start : batch_start + GENERATION_BATCH_SIZE]
@@ -163,14 +577,17 @@ def _generate_quiz_with_llm(
         plan_json = json.dumps(batch_plan, indent=2)
         expected_numbers = [requirement["number"] for requirement in batch_requirements]
         validation_feedback = ""
+        previous_response = ""
+        last_batch_data: Dict[str, Any] = {"questions": []}
 
         for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
             prompt = f"""You are an expert tutor creating version {version_num} of a grounded course quiz.
 
-Follow the assessment blueprint exactly. Each requirement is a comparable slot shared by every quiz version.
+Follow this version's assessment plan exactly. Overall coverage is comparable across versions, but slot content and modalities are deliberately permuted.
 Create a distinct question for this version while preserving the slot's topic, learning outcome, question kind, and difficulty.
 Use only facts supported by the course material.
 Return exactly {len(batch_requirements)} questions, numbered {expected_numbers}. Do not return an example or omit any assigned question.
+This is version {version_num}. Do not reuse the task framing, scenario, code, numerical setup, plot shape, or central question used in earlier versions. Assess a meaningfully different aspect of the assigned outcome whenever the source material permits it.
 
 Question-kind rules:
 - single_choice: exactly four options A-D and exactly one correct answer
@@ -180,8 +597,14 @@ Question-kind rules:
 Assessment-modality rules:
 - conceptual: assess explanation, comparison, or application of a concept
 - formula: use valid dollar-delimited LaTeX; prefer $...$ inline math unless a display block is genuinely needed, and JSON-escape every LaTeX backslash
-- code: include a short, self-contained code snippet and ask for interpretation, prediction, completion, or debugging
-- plot_interpretation: provide a concrete plot_spec with numeric x and y values; ask students to interpret the generated plot, not an imagined plot or superficial labels/colors
+- code: include one short, self-contained fenced Markdown code block in the question prompt and ask for interpretation, prediction, or debugging; define every input value; answer choices must be prose or outputs rather than code; never emit literal \\n sequences, a one-backtick language block, answer-revealing comments, or answer-revealing names
+- plot_interpretation: provide a concrete, title-less plot_spec with numeric x and y values; ask students to interpret the generated plot, not an imagined plot or superficial labels/colors
+- grounding: make every question concrete and answerable by supplying a dataset, numerical values, code, formula, plot, result, or realistic decision scenario; avoid vague prompts that merely ask which abstract description is best
+- clustering plots: use at least 30 points arranged into at least two visually distinct groups and provide a groups array aligned with x and y so the structure cannot reasonably be mistaken for a regression trend
+- plot display: never include raw x/y values, coordinate pairs, a “Plot Points” section, or a data table in the student-facing question; the generated image is the only presentation of plot data
+- student solvability: every question must be answerable by inspection and reasonable hand calculation; never require executing code, reproducing pseudorandom output, fitting a model, or knowing an API/class not explicitly shown in the selected lecture notes
+- course scope: assess only content in the selected lecture notes or explicit learning outcomes; the syllabus does not authorize quiz content, and a broad outcome does not authorize specific algorithms, packages, classes, or APIs that neither source names
+- plot choice: use histogram for distribution shape, location, dispersion, skewness, kurtosis, or modality questions; use scatter only for relationships or clusters
 
 Return your response as a JSON object with this exact structure:
 {{
@@ -207,16 +630,22 @@ Return your response as a JSON object with this exact structure:
 
 For a plot_interpretation question, replace plot_spec with:
 {{
-    "plot_type": "line, scatter, or bar",
+    "plot_type": "line, scatter, bar, or histogram",
     "x": [numeric values],
     "y": [numeric values],
-    "title": "plot title",
+    "title": "",
     "x_label": "x-axis label",
-    "y_label": "y-axis label"
+    "y_label": "y-axis label",
+    "groups": null
 }}
+
+Never use a plot title: the title may reveal the answer. For a clustering question, replace groups with one group identifier per point and use at least 30 points. For other plots, groups may be null.
 
 ASSESSMENT BLUEPRINT:
 {plan_json}
+
+EARLIER-VERSION QUESTIONS THAT MUST NOT BE REUSED:
+{json.dumps(avoidance_list, ensure_ascii=False, indent=2)}
 
 {validation_feedback}
 
@@ -232,27 +661,77 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
                 messages=[{"role": "user", "content": prompt}],
             )
             response_text = response.choices[0].message.content or ""
+            previous_response = response_text
             try:
                 batch_data = json.loads(response_text)
             except json.JSONDecodeError as exc:
                 errors = [f"response was not valid JSON: {exc.msg}"]
             else:
-                normalize_formula_delimiters(batch_data, batch_plan)
+                _normalize_generated_data(batch_data, batch_plan)
+                last_batch_data = batch_data
                 errors = validate_generated_quiz(batch_data, batch_plan)
+                errors.extend(_material_grounding_errors(batch_data, course_material))
+                errors.extend(_answer_exposure_errors(batch_data))
+                errors.extend(_question_similarity_errors(batch_data, prior_question_prompts))
                 if not errors:
                     generated_questions.extend(batch_data["questions"])
                     break
 
             validation_feedback = (
-                "PREVIOUS ATTEMPT FAILED VALIDATION. Correct every issue below and return the entire assigned batch:\n- "
+                "PREVIOUS ATTEMPT FAILED VALIDATION. Repair the previous JSON rather than creating an unrelated replacement. "
+                "Correct every issue below and return the entire assigned batch:\n- "
                 + "\n- ".join(errors)
+                + "\n\nPREVIOUS INVALID JSON:\n"
+                + previous_response[:12000]
             )
         else:
-            batch_label = f"{expected_numbers[0]}-{expected_numbers[-1]}"
-            raise ValueError(
-                f"Could not generate a valid question batch ({batch_label}) after "
-                f"{MAX_GENERATION_ATTEMPTS} attempts: {'; '.join(errors)}"
-            )
+            # Preserve any valid questions from the last batch and repair only
+            # invalid/missing slots with smaller, focused requests.
+            candidates = last_batch_data.get("questions")
+            by_number = {
+                question.get("number"): question
+                for question in candidates
+                if isinstance(candidates, list) and isinstance(question, dict)
+            } if isinstance(candidates, list) else {}
+            repaired_batch: List[Dict[str, Any]] = []
+            for requirement in batch_requirements:
+                candidate = by_number.get(requirement["number"])
+                candidate_data = {"questions": [candidate]} if isinstance(candidate, dict) else {"questions": []}
+                single_plan = {"version": version_num, "requirements": [requirement]}
+                if isinstance(candidate, dict):
+                    _normalize_generated_data(candidate_data, single_plan)
+                candidate_errors = validate_generated_quiz(candidate_data, single_plan)
+                candidate_errors.extend(_material_grounding_errors(candidate_data, course_material))
+                candidate_errors.extend(_answer_exposure_errors(candidate_data))
+                candidate_errors.extend(_question_similarity_errors(candidate_data, prior_question_prompts))
+                if candidate_errors:
+                    candidate = _repair_question_with_llm(
+                        client,
+                        requirement,
+                        candidate if isinstance(candidate, dict) else None,
+                        course_material,
+                        version_num,
+                        prior_question_prompts,
+                    )
+                    if candidate.pop("_modality_fallback", None):
+                        requirement["modality"] = "conceptual"
+                    _normalize_generated_data(
+                        {"questions": [candidate]},
+                        {"version": version_num, "requirements": [requirement]},
+                    )
+                repaired_batch.append(candidate)
+
+            repaired_data = {"questions": repaired_batch}
+            repaired_errors = validate_generated_quiz(repaired_data, batch_plan)
+            repaired_errors.extend(_material_grounding_errors(repaired_data, course_material))
+            repaired_errors.extend(_answer_exposure_errors(repaired_data))
+            if repaired_errors:
+                batch_label = f"{expected_numbers[0]}-{expected_numbers[-1]}"
+                raise ValueError(
+                    f"Could not generate a valid question batch ({batch_label}) after batch and focused repairs: "
+                    + "; ".join(repaired_errors)
+                )
+            generated_questions.extend(repaired_batch)
 
     quiz_data = {"questions": generated_questions}
     errors = validate_generated_quiz(quiz_data, plan)
@@ -262,6 +741,11 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
     supplementary_files = _write_plot_artifacts(quiz_data, output_dir, version_num)
     quiz_content = _format_quiz_from_llm(quiz_data, output_format)
     answer_key = _format_answer_key_from_llm(quiz_data, output_format)
+    prior_question_prompts.extend(
+        str(question.get("question", "")).strip()
+        for question in generated_questions
+        if str(question.get("question", "")).strip()
+    )
 
     return quiz_content, answer_key, supplementary_files
 
@@ -294,13 +778,20 @@ def _write_plot_artifacts(quiz_data: Dict[str, Any], output_dir: Path, quiz_numb
             f"OUTPUT_PATH = Path({str(plot_path.resolve())!r})\n\n"
             "fig, ax = plt.subplots(figsize=(7, 4.5))\n"
             "plot_type = SPEC['plot_type']\n"
+            "groups = SPEC.get('groups')\n"
             "if plot_type == 'scatter':\n"
-            "    ax.scatter(SPEC['x'], SPEC['y'])\n"
+            "    if groups:\n"
+            "        labels = {label: index for index, label in enumerate(dict.fromkeys(map(str, groups)))}\n"
+            "        colors = [labels[str(group)] for group in groups]\n"
+            "        ax.scatter(SPEC['x'], SPEC['y'], c=colors, cmap='tab10')\n"
+            "    else:\n"
+            "        ax.scatter(SPEC['x'], SPEC['y'])\n"
+            "elif plot_type == 'histogram':\n"
+            "    ax.hist(SPEC['x'], bins='auto', edgecolor='black')\n"
             "elif plot_type == 'bar':\n"
             "    ax.bar(SPEC['x'], SPEC['y'])\n"
             "else:\n"
             "    ax.plot(SPEC['x'], SPEC['y'], marker='o')\n"
-            "ax.set_title(SPEC.get('title', ''))\n"
             "ax.set_xlabel(SPEC.get('x_label', ''))\n"
             "ax.set_ylabel(SPEC.get('y_label', ''))\n"
             "ax.grid(alpha=0.2)\n"
@@ -321,7 +812,7 @@ def _write_plot_artifacts(quiz_data: Dict[str, Any], output_dir: Path, quiz_numb
             raise RuntimeError(f"Plot generation failed for question {q_num}: {detail}")
 
         question["plot_path"] = f"../supplementary/plots/{plot_path.name}"
-        question["plot_alt"] = spec.get("title") or f"Plot for question {q_num}"
+        question["plot_alt"] = f"Data visualization for question {q_num}"
         question["question"] = re.sub(
             r"^(?:Given|Based on|In) (?:a|the) plot[^,?.]*[,?.]?\s*",
             "Using the generated plot below, ",
@@ -358,6 +849,13 @@ def _format_quiz_from_llm(quiz_data: Dict[str, Any], output_format: str) -> str:
         options = q.get("options", {})
 
         if output_format == "markdown":
+            q_text = re.sub(
+                r"\s*```(?:python|py|r)?[ \t]*\n?(.*?)```",
+                lambda match: f"\n\n```python\n{match.group(1).strip()}\n```\n\n",
+                q_text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            q_text = q_text.rstrip()
             if q.get("plot_path"):
                 lines.append(f"![{q.get('plot_alt', 'Question plot')}]({q['plot_path']})")
                 lines.append("")
@@ -366,7 +864,14 @@ def _format_quiz_from_llm(quiz_data: Dict[str, Any], output_format: str) -> str:
             if options:
                 for letter in ["A", "B", "C", "D"]:
                     if letter in options:
-                        lines.append(f"{letter}. {options[letter]}  ")
+                        option_text = str(options[letter]).strip()
+                        option_text = re.sub(
+                            r"(?is)^```(?:python|py|r)?\s*(.*?)\s*```$",
+                            lambda match: match.group(1).strip(),
+                            option_text,
+                        )
+                        option_text = re.sub(r"\s*\n\s*", "<br>", option_text)
+                        lines.append(f"{letter}. {option_text}  ")
                 lines.append("")
             else:
                 lines.append("*Open-ended question. Provide a detailed answer.*")
@@ -454,6 +959,20 @@ def generate_quizzes(
     for folder in ["quizzes", "answer_keys", "audit", "supplementary/code", "supplementary/plots"]:
         (output_path / folder).mkdir(parents=True, exist_ok=True)
 
+    # A generation run owns these derived artifacts. Remove the previous set
+    # up front so a failed run cannot leave new quiz 1 beside stale quizzes 2–3.
+    generated_patterns = {
+        "quizzes": ("quiz_*.md", "quiz_*.tex"),
+        "answer_keys": ("quiz_*_key.md", "quiz_*_key.tex"),
+        "audit": ("blueprint.json", "generation_audit.md"),
+        "supplementary/code": ("quiz_*_plot.py",),
+        "supplementary/plots": ("quiz_*_plot.png",),
+    }
+    for folder, patterns in generated_patterns.items():
+        for pattern in patterns:
+            for artifact in (output_path / folder).glob(pattern):
+                artifact.unlink()
+
     topic_values = _coerce_topic_phrases(topics)
     numeric_topics = {
         normalized
@@ -493,10 +1012,13 @@ def generate_quizzes(
     ]
     material_summary = _extract_material_summary(selected_map)
     material_parts: List[str] = []
-    for files in selected_map.values():
+    assessable_groups = {"lecture_notes", "MLO"}
+    for group, files in selected_map.items():
+        if group not in assessable_groups:
+            continue
         for path in files:
             material_parts.append(f"--- From {path.name} ---\n{_normalize_text(parse_document(path))}\n")
-    course_material = "\n".join(material_parts) or "No course materials found."
+    course_material = "\n".join(material_parts) or "No selected lecture-note materials found."
 
     resolved_lecture_topics = list(dict.fromkeys(
         _topic_name_from_lecture(path) for path in selected_map.get("lecture_notes", [])
@@ -510,6 +1032,12 @@ def generate_quizzes(
         else document_map.get("MLO", [])
     )
     outcomes = extract_learning_outcomes(selected_mlo_files, input_path)
+    if not outcomes:
+        outcomes = [LearningOutcome(
+            identifier="LO-LECTURE",
+            statement="Apply only concepts explicitly taught in the selected lecture notes and learning outcomes.",
+            source="lecture_notes",
+        )]
     blueprint = build_blueprint(
         num_versions=num_versions,
         num_questions=num_questions,
@@ -521,6 +1049,7 @@ def generate_quizzes(
     quiz_files: List[str] = []
     key_files: List[str] = []
     supplementary_files: List[str] = []
+    prior_question_prompts: List[str] = []
 
     for version_num in range(1, num_versions + 1):
         try:
@@ -530,6 +1059,7 @@ def generate_quizzes(
                 version_num,
                 output_format,
                 output_path,
+                prior_question_prompts,
             )
         except Exception as e:
             raise RuntimeError(f"LLM generation failed for version {version_num}: {e}")
@@ -589,7 +1119,7 @@ def generate_quizzes(
         f"- **Quiz Output Files**: {(output_path / 'quizzes').exists()} ✓" if (output_path / 'quizzes').exists() else "- **Quiz Output Files**: False ✗",
         f"- **Answer Key Output Files**: {(output_path / 'answer_keys').exists()} ✓" if (output_path / 'answer_keys').exists() else "- **Answer Key Output Files**: False ✗",
         f"- **Supplementary Files**: {(output_path / 'supplementary').exists()} ✓" if (output_path / 'supplementary').exists() else "- **Supplementary Files**: False ✗",
-        "- **Blueprint Parity**: PASS (all versions generated from the same assessment slots)",
+        "- **Alternate-Version Plan**: PASS (coverage retained while slot content and modalities are permuted)",
         "",
         "## Assessment Blueprint",
         "",
