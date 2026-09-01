@@ -14,6 +14,7 @@ from quizzer.blueprint import (
 )
 from quizzer.generator import generate_quizzes
 from quizzer.input_loader import collect_input_documents
+from quizzer.notebook import generate_quizzes_from_files
 from quizzer.parsers import parse_document
 
 
@@ -23,7 +24,7 @@ REAL_LLM_GENERATION = generator_module._generate_quiz_with_llm
 @pytest.fixture(autouse=True)
 def stub_llm_generation(monkeypatch):
     """Keep the suite deterministic and offline while exercising the full pipeline."""
-    def generate(_material, blueprint, version_num, output_format):
+    def generate(_material, blueprint, version_num, output_format, _output_dir):
         questions = []
         for slot in blueprint.slots:
             kind = slot.question_kind.value
@@ -41,10 +42,19 @@ def stub_llm_generation(monkeypatch):
                 "correct_answers": answers,
                 "explanation": "Grounded explanation.",
                 "source_references": [slot.learning_outcome.source or "course material"],
+                "plot_spec": {
+                    "plot_type": "scatter",
+                    "x": [1, 2, 3],
+                    "y": [2, 3, 5],
+                    "title": "Example plot",
+                    "x_label": "x",
+                    "y_label": "y",
+                } if slot.modality.value == "plot_interpretation" else None,
             })
         return (
             generator_module._format_quiz_from_llm({"questions": questions}, output_format),
             generator_module._format_answer_key_from_llm({"questions": questions}, output_format),
+            [],
         )
 
     monkeypatch.setattr(generator_module, "_generate_quiz_with_llm", generate)
@@ -181,7 +191,7 @@ def test_blueprint_validator_rejects_wrong_question_kind():
     assert any("question_kind does not match" in error for error in errors)
 
 
-def test_llm_generation_batches_and_retries_incomplete_responses(monkeypatch):
+def test_llm_generation_batches_and_retries_incomplete_responses(monkeypatch, tmp_path):
     blueprint = build_blueprint(
         num_versions=1,
         num_questions=6,
@@ -205,6 +215,14 @@ def test_llm_generation_batches_and_retries_incomplete_responses(monkeypatch):
             "correct_answers": ["A", "C"] if kind == "multiple_select" else ["A"],
             "explanation": "Explanation",
             "source_references": ["notes.md"],
+            "plot_spec": {
+                "plot_type": "scatter",
+                "x": [1, 2, 3],
+                "y": [2, 4, 5],
+                "title": "Observed relationship",
+                "x_label": "x",
+                "y_label": "y",
+            } if requirement["modality"] == "plot_interpretation" else None,
         }
 
     requirements = blueprint.version_plan(1)["requirements"]
@@ -227,12 +245,19 @@ def test_llm_generation_batches_and_retries_incomplete_responses(monkeypatch):
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     monkeypatch.setattr(generator_module, "_get_client", lambda: fake_client)
 
-    quiz, answer_key = REAL_LLM_GENERATION("course material", blueprint, 1, "markdown")
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    quiz, answer_key, artifacts = REAL_LLM_GENERATION(
+        "course material", blueprint, 1, "markdown", output_dir
+    )
 
     assert len(completions.calls) == 3
     assert all(call["response_format"] == {"type": "json_object"} for call in completions.calls)
     assert "6. Grounded question" in quiz
     assert "6. **A**" in answer_key
+    assert any(path.endswith(".py") for path in artifacts)
+    assert any(path.endswith(".png") for path in artifacts)
+    assert "![Observed relationship]" in quiz
 
 
 def test_formula_validation_accepts_options_and_normalizes_delimiters():
@@ -260,7 +285,7 @@ def test_formula_validation_accepts_options_and_normalizes_delimiters():
     normalize_formula_delimiters(data, batch_plan)
     errors = validate_generated_quiz(data, batch_plan)
 
-    assert "$$P(A)=0.5$$" in data["questions"][0]["explanation"]
+    assert "$P(A)=0.5$" in data["questions"][0]["explanation"]
     assert errors == []
 
 
@@ -285,6 +310,40 @@ def test_formula_modality_without_display_math_does_not_abort_generation():
     }]}
 
     assert validate_generated_quiz(data, batch_plan) == []
+
+
+def test_math_normalization_repairs_json_escape_control_characters():
+    data = {"questions": [{
+        "number": 1,
+        "question": "Choose the correct expression.",
+        "options": {
+            "A": "$\bar{x} = \frac{1}{N} \times \text{sum}(x)$",
+            "B": "$Y = f(X) + \nu$",
+            "C": "$Y = f(X) + \regexpsilon$",
+            "D": "No formula",
+        },
+        "explanation": "$\beta$ is a coefficient.",
+    }]}
+
+    normalize_formula_delimiters(data, {"requirements": []})
+    rendered = "\n".join(data["questions"][0]["options"].values())
+
+    assert r"$\bar{x} = \frac{1}{N} \times \text{sum}(x)$" in rendered
+    assert r"$Y = f(X) + \nu$" in rendered
+    assert r"$Y = f(X) + \epsilon$" in rendered
+    assert r"$\beta$" in data["questions"][0]["explanation"]
+
+
+def test_markdown_answer_choices_use_explicit_line_breaks():
+    quiz = generator_module._format_quiz_from_llm({"questions": [{
+        "number": 1,
+        "question_kind": "single_choice",
+        "question": "Question?",
+        "options": {"A": "One", "B": "Two", "C": "Three", "D": "Four"},
+        "correct_answers": ["A"],
+    }]}, "markdown")
+
+    assert "A. One  \nB. Two  \nC. Three  \nD. Four  " in quiz
 
 
 def test_numeric_topics_select_numbered_lectures_and_matching_outcomes(tmp_path):
@@ -319,3 +378,47 @@ def test_numeric_topics_select_numbered_lectures_and_matching_outcomes(tmp_path)
     assert "05-Regression.html" in audit
     assert "05-Regression-draft.html" not in audit
     assert "07-PCA.html" not in audit
+
+
+def test_notebook_generation_accepts_named_paths(tmp_path):
+    source_dir = tmp_path / "downloads"
+    source_dir.mkdir()
+    lecture_one = source_dir / "download-a.html"
+    lecture_two = source_dir / "download-b.html"
+    outcomes = source_dir / "outcomes.txt"
+    lecture_one.write_text("descriptive statistics", encoding="utf-8")
+    lecture_two.write_text("probability distributions", encoding="utf-8")
+    outcomes.write_text("- Explain distributions using examples", encoding="utf-8")
+    output_dir = tmp_path / "notebook_outputs"
+
+    manifest = generate_quizzes_from_files(
+        input_files={
+            "lecture_notes": {
+                "01-Description.html": lecture_one,
+                "02-Distributions.html": lecture_two,
+            },
+            "learning_outcomes": {"0102_Outcomes.txt": outcomes},
+        },
+        output_dir=output_dir,
+        num_versions=1,
+        num_questions=4,
+        question_type="mixed",
+    )
+
+    assert manifest["blueprint"]["topics"] == ["Description", "Distributions"]
+    assert manifest["input_files"]["lecture_notes"] == [
+        str(lecture_one.resolve()),
+        str(lecture_two.resolve()),
+    ]
+    assert (output_dir / "quizzes" / "quiz_01.md").exists()
+    audit = (output_dir / "audit" / "generation_audit.md").read_text(encoding="utf-8")
+    assert "Notebook-supplied files" in audit
+    assert "quizzer-notebook-" not in audit
+
+
+def test_notebook_generation_rejects_missing_file(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Notebook input file does not exist"):
+        generate_quizzes_from_files(
+            input_files={"lecture_notes": [tmp_path / "missing.html"]},
+            output_dir=tmp_path / "outputs",
+        )

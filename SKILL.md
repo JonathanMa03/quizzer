@@ -11,7 +11,9 @@ Before generating question prose, create one assessment blueprint shared by all 
 
 The user-facing question mode must be either `mixed` or `open`. A `mixed` quiz contains both single-answer multiple-choice and multiple-select questions; determine their distribution internally rather than asking for a multiple-select count. An `open` quiz contains only open-ended questions.
 
-Blueprint slots may assess concepts through prose, formula work, code reasoning, or plot interpretation when supported by the course materials. Put display formulas inside `$$...$$` blocks.
+Blueprint slots may assess concepts through prose, formula work, code reasoning, or plot interpretation when supported by the course materials. Use notebook-compatible dollar-sign math delimiters and prefer inline `$...$` when display math is unnecessary.
+
+Render Markdown answer choices with explicit line breaks so A, B, C, and D never collapse onto one line. A plot-interpretation question must reference an actual generated image. Save its reproducible generator under `outputs/supplementary/code/`, save the image under `outputs/supplementary/plots/`, and link the image from the quiz. Never ask students to interpret an imagined “given plot.” Normalize generated LaTeX before rendering so JSON escape sequences cannot corrupt commands such as `\bar`, `\frac`, `\nu`, or `\epsilon`; inline `$...$` math is preferred when a display block is unnecessary.
 
 Treat the emitted `outputs/audit/blueprint.json` as the authoritative run plan. If a prose rule conflicts with the user's explicit CLI arguments or the executable blueprint, follow the user arguments and report the conflict in the audit.
 

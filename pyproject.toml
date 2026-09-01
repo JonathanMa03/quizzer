@@ -14,10 +14,12 @@ dependencies = [
   "beautifulsoup4>=4.12.3",
   "markdown>=3.6",
   "openai>=1.0.0",
+  "matplotlib>=3.8.0",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+notebook = ["ipykernel>=6.29"]
 
 [project.scripts]
 gen_quizzes = "quizzer.cli:main"

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -139,7 +141,8 @@ def _generate_quiz_with_llm(
     blueprint: QuizBlueprint,
     version_num: int,
     output_format: str,
-) -> tuple[str, str]:
+    output_dir: Path,
+) -> tuple[str, str, List[str]]:
     """
     Use OpenAI to generate quiz questions and answers based on course material.
     Returns: (quiz_content, answer_key_content)
@@ -176,9 +179,9 @@ Question-kind rules:
 
 Assessment-modality rules:
 - conceptual: assess explanation, comparison, or application of a concept
-- formula: when the question uses display math, put it in a $$...$$ block; do not use \\[...\\] delimiters
+- formula: use valid dollar-delimited LaTeX; prefer $...$ inline math unless a display block is genuinely needed, and JSON-escape every LaTeX backslash
 - code: include a short, self-contained code snippet and ask for interpretation, prediction, completion, or debugging
-- plot_interpretation: ask students to interpret a plot supported by the supplied materials; do not test superficial labels or colors
+- plot_interpretation: provide a concrete plot_spec with numeric x and y values; ask students to interpret the generated plot, not an imagined plot or superficial labels/colors
 
 Return your response as a JSON object with this exact structure:
 {{
@@ -196,9 +199,20 @@ Return your response as a JSON object with this exact structure:
             }},
             "correct_answers": ["A"],
             "explanation": "why the answer is correct",
-            "source_references": ["source filename"]
+            "source_references": ["source filename"],
+            "plot_spec": null
         }}
     ]
+}}
+
+For a plot_interpretation question, replace plot_spec with:
+{{
+    "plot_type": "line, scatter, or bar",
+    "x": [numeric values],
+    "y": [numeric values],
+    "title": "plot title",
+    "x_label": "x-axis label",
+    "y_label": "y-axis label"
 }}
 
 ASSESSMENT BLUEPRINT:
@@ -245,10 +259,80 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
     if errors:
         raise ValueError("Generated quiz violated its blueprint: " + "; ".join(errors))
 
+    supplementary_files = _write_plot_artifacts(quiz_data, output_dir, version_num)
     quiz_content = _format_quiz_from_llm(quiz_data, output_format)
     answer_key = _format_answer_key_from_llm(quiz_data, output_format)
 
-    return quiz_content, answer_key
+    return quiz_content, answer_key, supplementary_files
+
+
+def _write_plot_artifacts(quiz_data: Dict[str, Any], output_dir: Path, quiz_number: int) -> List[str]:
+    """Write and execute reproducible scripts for every plot question."""
+    code_dir = output_dir / "supplementary" / "code"
+    plot_dir = output_dir / "supplementary" / "plots"
+    code_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    artifacts: List[str] = []
+
+    for question in quiz_data.get("questions", []):
+        if question.get("modality") != "plot_interpretation":
+            continue
+        q_num = int(question["number"])
+        spec = question["plot_spec"]
+        stem = f"quiz_{quiz_number:02d}_q{q_num:02d}_plot"
+        code_path = code_dir / f"{stem}.py"
+        plot_path = plot_dir / f"{stem}.png"
+        spec_json = json.dumps(spec, ensure_ascii=False)
+        script = (
+            "from __future__ import annotations\n\n"
+            "import json\n"
+            "from pathlib import Path\n\n"
+            "import matplotlib\n"
+            "matplotlib.use('Agg')\n"
+            "import matplotlib.pyplot as plt\n\n"
+            f"SPEC = json.loads({spec_json!r})\n"
+            f"OUTPUT_PATH = Path({str(plot_path.resolve())!r})\n\n"
+            "fig, ax = plt.subplots(figsize=(7, 4.5))\n"
+            "plot_type = SPEC['plot_type']\n"
+            "if plot_type == 'scatter':\n"
+            "    ax.scatter(SPEC['x'], SPEC['y'])\n"
+            "elif plot_type == 'bar':\n"
+            "    ax.bar(SPEC['x'], SPEC['y'])\n"
+            "else:\n"
+            "    ax.plot(SPEC['x'], SPEC['y'], marker='o')\n"
+            "ax.set_title(SPEC.get('title', ''))\n"
+            "ax.set_xlabel(SPEC.get('x_label', ''))\n"
+            "ax.set_ylabel(SPEC.get('y_label', ''))\n"
+            "ax.grid(alpha=0.2)\n"
+            "fig.tight_layout()\n"
+            "OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)\n"
+            "fig.savefig(OUTPUT_PATH, dpi=160)\n"
+            "plt.close(fig)\n"
+        )
+        code_path.write_text(script, encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, str(code_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0 or not plot_path.is_file():
+            detail = completed.stderr.strip() or "plot file was not created"
+            raise RuntimeError(f"Plot generation failed for question {q_num}: {detail}")
+
+        question["plot_path"] = f"../supplementary/plots/{plot_path.name}"
+        question["plot_alt"] = spec.get("title") or f"Plot for question {q_num}"
+        question["question"] = re.sub(
+            r"^(?:Given|Based on|In) (?:a|the) plot[^,?.]*[,?.]?\s*",
+            "Using the generated plot below, ",
+            question["question"],
+            flags=re.IGNORECASE,
+        )
+        artifacts.extend([
+            str(code_path.relative_to(output_dir.parent)),
+            str(plot_path.relative_to(output_dir.parent)),
+        ])
+    return artifacts
 
 
 def _format_quiz_from_llm(quiz_data: Dict[str, Any], output_format: str) -> str:
@@ -261,6 +345,7 @@ def _format_quiz_from_llm(quiz_data: Dict[str, Any], output_format: str) -> str:
     else:
         lines.append("\\documentclass{article}")
         lines.append("\\usepackage[margin=1in]{geometry}")
+        lines.append("\\usepackage{graphicx}")
         lines.append("\\begin{document}")
         lines.append("\\section*{Quiz}")
         lines.append("")
@@ -273,17 +358,23 @@ def _format_quiz_from_llm(quiz_data: Dict[str, Any], output_format: str) -> str:
         options = q.get("options", {})
 
         if output_format == "markdown":
+            if q.get("plot_path"):
+                lines.append(f"![{q.get('plot_alt', 'Question plot')}]({q['plot_path']})")
+                lines.append("")
             lines.append(f"{q_num}. {q_text}")
             lines.append("")
             if options:
                 for letter in ["A", "B", "C", "D"]:
                     if letter in options:
-                        lines.append(f"{letter}. {options[letter]}")
+                        lines.append(f"{letter}. {options[letter]}  ")
                 lines.append("")
             else:
                 lines.append("*Open-ended question. Provide a detailed answer.*")
                 lines.append("")
         else:
+            if q.get("plot_path"):
+                lines.append(f"\\includegraphics[width=0.8\\linewidth]{{{q['plot_path']}}}")
+                lines.append("")
             lines.append(f"\\textbf{{Question {q_num}}}. {q_text}")
             lines.append("")
             if options:
@@ -350,6 +441,7 @@ def generate_quizzes(
     question_type: str = "mixed",
     output_format: str = "markdown",
     topics: List[str] | None = None,
+    source_description: str | None = None,
 ) -> Dict[str, Any]:
     """Generate quiz versions using LLM-based question generation."""
     if question_type not in SUPPORTED_QUESTION_TYPES:
@@ -432,11 +524,12 @@ def generate_quizzes(
 
     for version_num in range(1, num_versions + 1):
         try:
-            quiz_content, answer_key_content = _generate_quiz_with_llm(
+            quiz_content, answer_key_content, generated_supplementary = _generate_quiz_with_llm(
                 course_material,
                 blueprint,
                 version_num,
                 output_format,
+                output_path,
             )
         except Exception as e:
             raise RuntimeError(f"LLM generation failed for version {version_num}: {e}")
@@ -450,7 +543,7 @@ def generate_quizzes(
         key_path.write_text(answer_key_content, encoding="utf-8")
         key_files.append(str(key_path.relative_to(output_path.parent)))
 
-        supplementary_files.extend(_write_supplementary_files(output_path, version_num))
+        supplementary_files.extend(generated_supplementary)
 
     audit_path = output_path / "audit" / "generation_audit.md"
     blueprint_path = output_path / "audit" / "blueprint.json"
@@ -462,7 +555,7 @@ def generate_quizzes(
         "## Generation Summary",
         "",
         f"- **Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"- **Input Directory**: {input_path.absolute()}",
+        f"- **Input Source**: {source_description or input_path.absolute()}",
         f"- **Output Directory**: {output_path.absolute()}",
         "",
         "## Request Parameters",
@@ -545,34 +638,3 @@ def generate_quizzes(
         "blueprint_file": str(blueprint_path.relative_to(output_path.parent)),
         "blueprint": blueprint.to_dict(),
     }
-
-
-def _write_supplementary_files(output_dir: Path, quiz_number: int) -> List[str]:
-    """Write placeholder supplementary files for manual population."""
-    code_dir = output_dir / "supplementary" / "code"
-    plot_dir = output_dir / "supplementary" / "plots"
-    code_dir.mkdir(parents=True, exist_ok=True)
-    plot_dir.mkdir(parents=True, exist_ok=True)
-
-    code_path = code_dir / f"quiz_{quiz_number:02d}_support.py"
-    code_path.write_text(
-        "# Generated by Quizzer\n"
-        "# This script can be adapted to create a plot or analysis artifact for the associated quiz.\n\n"
-        "def build_supporting_example():\n"
-        "    return {\n"
-        "        'quiz_number': 1,\n"
-        "        'purpose': 'Generate a supporting plot or analysis artifact for this question set.',\n"
-        "    }\n\n"
-        "if __name__ == '__main__':\n"
-        "    print(build_supporting_example())\n",
-        encoding="utf-8",
-    )
-
-    plot_path = plot_dir / f"quiz_{quiz_number:02d}_plot.md"
-    plot_path.write_text(
-        f"# Quiz {quiz_number} Supporting Plot\n\n"
-        "This file is a placeholder for a generated visualization or figure description.\n",
-        encoding="utf-8",
-    )
-
-    return [str(code_path.relative_to(output_dir.parent)), str(plot_path.relative_to(output_dir.parent))]

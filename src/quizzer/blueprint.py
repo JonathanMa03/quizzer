@@ -89,7 +89,14 @@ class QuizBlueprint:
 
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.+?)\s*$")
 _HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.+?)\s*$")
-_SINGLE_DOLLAR_MATH_RE = re.compile(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)", re.DOTALL)
+_MATH_SPAN_RE = re.compile(r"\${1,2}(.+?)\${1,2}", re.DOTALL)
+_LATEX_COMMANDS = {
+    "alpha", "bar", "beta", "cdot", "delta", "epsilon", "exp", "frac",
+    "gamma", "geq", "hat", "infty", "int", "lambda", "left", "leq",
+    "log", "mathbb", "mathcal", "mu", "nu", "partial", "phi", "pi",
+    "prod", "rho", "right", "sigma", "sqrt", "sum", "text", "theta",
+    "times", "vec",
+}
 
 
 def _question_text_values(question: dict) -> list[str]:
@@ -101,22 +108,43 @@ def _question_text_values(question: dict) -> list[str]:
 
 
 def normalize_formula_delimiters(quiz_data: dict, plan: dict) -> None:
-    """Normalize generated display math in formula slots to Markdown $$ blocks."""
+    """Repair JSON-damaged LaTeX and use notebook-safe inline math delimiters."""
     questions = quiz_data.get("questions")
     if not isinstance(questions, list):
         return
-    modalities = {item["number"]: item["modality"] for item in plan["requirements"]}
+
+    def repair_math_body(body: str) -> str:
+        control_replacements = {
+            "\b": r"\b",
+            "\f": r"\f",
+            "\n": r"\n",
+            "\r": r"\r",
+            "\t": r"\t",
+        }
+        for damaged, replacement in control_replacements.items():
+            body = body.replace(damaged, replacement)
+
+        def repair_command(match: re.Match[str]) -> str:
+            command = match.group(1)
+            damaged_aliases = {
+                "regexpsilon": "epsilon",
+                "xpsilon": "epsilon",
+            }
+            if command in damaged_aliases:
+                return f"\\{damaged_aliases[command]}"
+            if command in _LATEX_COMMANDS:
+                return f"\\{command}"
+            suffixes = [known for known in _LATEX_COMMANDS if command.endswith(known)]
+            return f"\\{max(suffixes, key=len)}" if suffixes else command
+
+        return re.sub(r"\\([A-Za-z]+)", repair_command, body).strip()
+
+    def normalize(value: str) -> str:
+        value = re.sub(r"\\\[(.*?)\\\]", r"$\1$", value, flags=re.DOTALL)
+        value = re.sub(r"\\\((.*?)\\\)", r"$\1$", value, flags=re.DOTALL)
+        return _MATH_SPAN_RE.sub(lambda match: f"${repair_math_body(match.group(1))}$", value)
+
     for question in questions:
-        if modalities.get(question.get("number")) != AssessmentModality.FORMULA.value:
-            continue
-        if "$$" in "\n".join(_question_text_values(question)):
-            continue
-
-        def normalize(value: str) -> str:
-            value = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", value, flags=re.DOTALL)
-            value = re.sub(r"\\\((.*?)\\\)", r"$$\1$$", value, flags=re.DOTALL)
-            return _SINGLE_DOLLAR_MATH_RE.sub(r"$$\1$$", value)
-
         if isinstance(question.get("question"), str):
             question["question"] = normalize(question["question"])
         if isinstance(question.get("explanation"), str):
@@ -275,4 +303,20 @@ def validate_generated_quiz(quiz_data: dict, plan: dict) -> list[str]:
                 errors.append(f"question {number}: choice answers must be letters A-D")
         elif options not in (None, {}):
             errors.append(f"question {number}: open-ended questions must not have options")
+        if expected["modality"] == AssessmentModality.PLOT_INTERPRETATION.value:
+            plot_spec = question.get("plot_spec")
+            if not isinstance(plot_spec, dict):
+                errors.append(f"question {number}: plot questions require a plot_spec object")
+            else:
+                x_values = plot_spec.get("x")
+                y_values = plot_spec.get("y")
+                plot_type = plot_spec.get("plot_type")
+                if plot_type not in {"line", "scatter", "bar"}:
+                    errors.append(f"question {number}: plot_type must be line, scatter, or bar")
+                if not isinstance(x_values, list) or not isinstance(y_values, list):
+                    errors.append(f"question {number}: plot_spec x and y must be lists")
+                elif len(x_values) < 2 or len(x_values) != len(y_values):
+                    errors.append(f"question {number}: plot_spec x and y must have equal lengths of at least 2")
+                elif any(not isinstance(value, (int, float)) for value in x_values + y_values):
+                    errors.append(f"question {number}: plot_spec x and y values must be numeric")
     return errors
