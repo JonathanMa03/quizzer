@@ -160,6 +160,32 @@ def test_cross_version_similarity_rejects_paraphrased_repeat():
     ]
 
 
+def test_within_quiz_similarity_rejects_repeated_questions_across_batches():
+    accepted = [{
+        "number": 2,
+        "question": "Which formula correctly calculates the sample variance?",
+    }]
+    later_batch = {"questions": [
+        {"number": 6, "question": "Which formula correctly calculates the sample variance?"},
+        {"number": 7, "question": "What does bandwidth control in kernel density estimation?"},
+    ]}
+
+    assert generator_module._within_quiz_similarity_errors(later_batch, accepted) == [
+        "question 6: too similar to another question in the same quiz"
+    ]
+
+
+def test_within_quiz_similarity_rejects_repeats_in_same_batch():
+    data = {"questions": [
+        {"number": 3, "question": "How does the median describe the center of ordered data?"},
+        {"number": 7, "question": "How does the median describe the center of ordered data?"},
+    ]}
+
+    assert generator_module._within_quiz_similarity_errors(data) == [
+        "question 7: too similar to another question in the same quiz"
+    ]
+
+
 def test_prompt_cannot_name_its_short_correct_answer():
     data = {"questions": [{
         "number": 4,
@@ -514,7 +540,14 @@ def test_llm_generation_batches_and_retries_incomplete_responses(monkeypatch, tm
     def make_question(requirement):
         kind = requirement["question_kind"]
         is_open = kind == "open_ended"
-        prompt = "Grounded question"
+        prompt = {
+            1: "Interpret a probability assigned to an event.",
+            2: "Compare two outcomes in a finite sample space.",
+            3: "Determine whether two stated events are independent.",
+            4: "Explain how conditioning changes an event probability.",
+            5: "Identify a valid complement rule application.",
+            6: "Analyze a simple repeated-trial scenario.",
+        }[requirement["number"]]
         if requirement["modality"] == "formula":
             prompt += " using $$P(A) = 1.$$"
         elif requirement["modality"] == "code":
@@ -570,7 +603,7 @@ def test_llm_generation_batches_and_retries_incomplete_responses(monkeypatch, tm
     assert "PREVIOUS INVALID JSON" in retry_prompt
     assert '"number": 1' in retry_prompt
     assert "expected 5 questions, received 1" in retry_prompt
-    assert "6. Grounded question" in quiz
+    assert "6. Analyze a simple repeated-trial scenario." in quiz
     assert "6. **A**" in answer_key
     assert any(path.endswith(".py") for path in artifacts)
     assert any(path.endswith(".png") for path in artifacts)
@@ -683,7 +716,8 @@ def test_formula_normalization_repairs_textstylebigg_corruption():
 
     rendered = data["questions"][0]["question"]
     assert "textstylebigg" not in rendered
-    assert r"\textstyle\bigg" in rendered
+    assert r"\textstyle" not in rendered
+    assert r"\bigg" not in rendered
 
 
 def test_formula_modality_without_display_math_does_not_abort_generation():
@@ -929,6 +963,11 @@ def test_distribution_plot_is_normalized_to_histogram():
     normalize_plot_specs(data, plan)
 
     assert question["plot_spec"]["plot_type"] == "histogram"
+    assert len(question["plot_spec"]["values"]) == 21
+    assert question["plot_spec"]["values"].count(1) == 3
+    assert question["plot_spec"]["values"].count(2) == 7
+    assert question["plot_spec"]["values"].count(3) == 5
+    assert question["plot_spec"]["values"].count(8) == 6
     assert "scatter" not in question["question"].lower()
     assert validate_generated_quiz(data, plan) == []
 
@@ -979,6 +1018,50 @@ def test_material_grounding_rejects_random_and_unintroduced_model_api():
     assert "question 1: code questions must not depend on random output" in errors
     assert "question 1: code questions must be solvable without fitting or running a model" in errors
     assert "question 1: package 'sklearn' is not introduced in the selected lecture notes" in errors
+
+
+def test_histogram_frequency_pairs_expand_to_literal_observations():
+    requirement = {
+        "number": 1,
+        "question_kind": "open_ended",
+        "modality": "plot_interpretation",
+        "topic": "Distribution shape",
+        "learning_outcome": {"statement": "Interpret a histogram distribution"},
+    }
+    question = {
+        "number": 1,
+        "question_kind": "open_ended",
+        "modality": "plot_interpretation",
+        "question": "Interpret the histogram.",
+        "options": None,
+        "correct_answers": ["The lower values occur less often."],
+        "plot_spec": {
+            "plot_type": "histogram",
+            "x": [5, 4, 3, 2, 1],
+            "y": [4, 2, 1, 2, 1],
+            "title": "",
+            "x_label": "Value",
+            "y_label": "Frequency",
+        },
+    }
+
+    normalize_plot_specs({"questions": [question]}, {"requirements": [requirement]})
+
+    assert question["plot_spec"]["values"] == [5, 5, 5, 5, 4, 4, 3, 2, 2, 1]
+    assert question["plot_spec"]["x"] == question["plot_spec"]["values"]
+    assert question["plot_spec"]["y"] == []
+
+
+def test_code_execution_validation_rejects_non_runnable_block():
+    data = {"questions": [{
+        "number": 3,
+        "question": "What is printed?\n```python\nprint(undefined_value)\n```",
+        "options": {"A": "1", "B": "2", "C": "3", "D": "4"},
+    }]}
+
+    errors = generator_module._code_execution_errors(data)
+
+    assert any("question 3: code is not runnable" in error for error in errors)
 
 
 def test_code_in_answer_options_does_not_satisfy_code_modality():

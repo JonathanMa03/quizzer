@@ -159,9 +159,8 @@ def normalize_formula_delimiters(quiz_data: dict, plan: dict) -> None:
         return re.sub(r"\\([A-Za-z]+)", repair_command, body).strip()
 
     def normalize(value: str) -> str:
-        value = re.sub(r"(?i)(?<!\\)textstylebigg", r"\\textstyle\\bigg", value)
-        value = re.sub(r"(?i)(?<!\\)textstyle", r"\\textstyle", value)
-        value = re.sub(r"(?i)(?<!\\)bigg(?=\s*[()\[\]])", r"\\bigg", value)
+        value = re.sub(r"(?i)\\?textstylebigg\b", "", value)
+        value = re.sub(r"(?i)\\?(?:textstyle|bigg|big)\b", "", value)
         value = re.sub(r"\\\[(.*?)\\\]", r"$\1$", value, flags=re.DOTALL)
         value = re.sub(r"\\\((.*?)\\\)", r"$\1$", value, flags=re.DOTALL)
         return _MATH_SPAN_RE.sub(lambda match: f"${repair_math_body(match.group(1))}$", value)
@@ -299,6 +298,24 @@ def normalize_plot_specs(quiz_data: dict, plan: dict) -> None:
             "distribution", "dispersion", "skew", "kurtosis", "histogram", "mode", "median"
         )):
             spec["plot_type"] = "histogram"
+        if spec.get("plot_type") == "histogram":
+            values = spec.get("values")
+            x_values = spec.get("x")
+            y_values = spec.get("y")
+            if not isinstance(values, list) or not values:
+                if (
+                    isinstance(x_values, list)
+                    and isinstance(y_values, list)
+                    and len(x_values) == len(y_values)
+                    and y_values
+                    and all(isinstance(count, int) and 0 <= count <= 100 for count in y_values)
+                ):
+                    values = [value for value, count in zip(x_values, y_values) for _ in range(count)]
+                elif isinstance(x_values, list):
+                    values = list(x_values)
+            spec["values"] = values
+            spec["x"] = values
+            spec["y"] = []
         if isinstance(question.get("question"), str):
             if spec.get("plot_type") == "scatter":
                 question["question"] = re.sub(
@@ -646,7 +663,7 @@ def validate_generated_quiz(quiz_data: dict, plan: dict) -> list[str]:
             option_text = "\n".join(
                 str(value) for value in question.get("options", {}).values()
             ) if isinstance(question.get("options"), dict) else ""
-            if "```" in option_text or re.search(
+            if "`" in option_text or re.search(
                 r"(?im)(?:^|<br>)\s*(?:import |from \w+ import |\w+\s*=|if |for |while |print\s*\()",
                 option_text,
             ):

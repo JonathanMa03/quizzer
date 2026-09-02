@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ast
 import os
 import re
 import subprocess
@@ -187,8 +188,13 @@ def _build_safe_fallback_question(requirement: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
-def _question_similarity_errors(data: Dict[str, Any], prior_questions: List[str]) -> List[str]:
-    """Reject near-duplicate stems across alternate versions."""
+def _question_similarity_errors(
+    data: Dict[str, Any],
+    prior_questions: List[str],
+    *,
+    context: str = "an earlier-version question",
+) -> List[str]:
+    """Reject near-duplicate stems against a supplied reference set."""
     errors: List[str] = []
     prior = [re.sub(r"\s+", " ", text).strip().casefold() for text in prior_questions if text.strip()]
     for question in data.get("questions", []):
@@ -202,9 +208,34 @@ def _question_similarity_errors(data: Dict[str, Any], prior_questions: List[str]
             overlap = len(current_words & old_words) / max(1, len(current_words | old_words))
             if ratio >= 0.72 or overlap >= 0.72:
                 errors.append(
-                    f"question {question.get('number')}: too similar to an earlier-version question"
+                    f"question {question.get('number')}: too similar to {context}"
                 )
                 break
+    return errors
+
+
+def _within_quiz_similarity_errors(
+    data: Dict[str, Any],
+    accepted_questions: List[Dict[str, Any]] | None = None,
+) -> List[str]:
+    """Reject repeats within a batch and against earlier batches of one quiz."""
+    references = [
+        str(question.get("question", ""))
+        for question in (accepted_questions or [])
+        if str(question.get("question", "")).strip()
+    ]
+    errors: List[str] = []
+    for question in data.get("questions", []):
+        errors.extend(
+            _question_similarity_errors(
+                {"questions": [question]},
+                references,
+                context="another question in the same quiz",
+            )
+        )
+        prompt = str(question.get("question", "")).strip()
+        if prompt:
+            references.append(prompt)
     return errors
 
 
@@ -283,6 +314,55 @@ def _answer_exposure_errors(data: Dict[str, Any]) -> List[str]:
     return errors
 
 
+def _code_execution_errors(data: Dict[str, Any]) -> List[str]:
+    """Require every fenced student-facing code block to be safe and runnable."""
+    errors: List[str] = []
+    allowed_imports = {"math", "statistics", "numpy", "pandas", "matplotlib"}
+    forbidden_names = {"eval", "exec", "open", "compile", "__import__", "input"}
+    for question in data.get("questions", []):
+        texts = [str(question.get("question", ""))]
+        if isinstance(question.get("options"), dict):
+            texts.extend(str(value) for value in question["options"].values())
+        blocks = [
+            match.group(1).strip()
+            for text_value in texts
+            for match in re.finditer(r"```(?:python|py)?\s*\n(.*?)\n```", text_value, re.DOTALL | re.IGNORECASE)
+        ]
+        for code in blocks:
+            try:
+                tree = ast.parse(code)
+            except SyntaxError as exc:
+                errors.append(f"question {question.get('number')}: code is not valid Python: {exc.msg}")
+                continue
+            unsafe = False
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    unsafe |= any(alias.name.split(".")[0] not in allowed_imports for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    unsafe |= (node.module or "").split(".")[0] not in allowed_imports
+                elif isinstance(node, ast.Name) and node.id in forbidden_names:
+                    unsafe = True
+            if unsafe:
+                errors.append(f"question {question.get('number')}: code uses a disallowed operation or import")
+                continue
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", code],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env={**os.environ, "MPLBACKEND": "Agg"},
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(f"question {question.get('number')}: code did not finish within 5 seconds")
+                continue
+            if completed.returncode != 0:
+                detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "execution failed"
+                errors.append(f"question {question.get('number')}: code is not runnable: {detail}")
+    return errors
+
+
 def _filter_outcomes_for_lecture(outcomes: List[Any], lecture_material: str) -> List[Any]:
     """Keep MLO statements whose substantive vocabulary is present in the notes."""
     stopwords = {
@@ -356,6 +436,7 @@ For open_ended, omit options and provide a concise model answer in correct_answe
 For code, put one shared executable snippet in a fenced Markdown block in the question prompt. Answer choices must be prose interpretations or outputs, never alternative code snippets. Provide every input value and use no answer-revealing comments, variable names, function names, or printed labels.
 For plot_interpretation, include plot_spec with plot_type, numeric x/y lists, empty title, axis labels, and groups when clustering is assessed. Plot questions still require A-D options when their question_kind is a choice type.
 Use only concepts and software explicitly present in the selected lecture material. The student must be able to answer without running code or using a computer; do not use random output or fitted-model behavior. Use a histogram—not a scatterplot—when asking about a distribution's shape, modes, location, dispersion, skewness, or kurtosis.
+Every Python block must be complete and run successfully as written. For a histogram, provide literal raw observations in plot_spec.values, including repeated values; do not provide artificial bin coordinates or frequencies.
 
 REQUIREMENT:
 {json.dumps(active_requirement, ensure_ascii=False, indent=2)}
@@ -391,6 +472,7 @@ Respond only with JSON."""
         structural_errors = validate_generated_quiz(data, single_plan)
         structural_errors.extend(_material_grounding_errors(data, course_material))
         structural_errors.extend(_answer_exposure_errors(data))
+        structural_errors.extend(_code_execution_errors(data))
         diversity_errors = _question_similarity_errors(data, prior_question_prompts or [])
         errors = structural_errors + diversity_errors
         if not structural_errors:
@@ -605,6 +687,8 @@ Assessment-modality rules:
 - student solvability: every question must be answerable by inspection and reasonable hand calculation; never require executing code, reproducing pseudorandom output, fitting a model, or knowing an API/class not explicitly shown in the selected lecture notes
 - course scope: assess only content in the selected lecture notes or explicit learning outcomes; the syllabus does not authorize quiz content, and a broad outcome does not authorize specific algorithms, packages, classes, or APIs that neither source names
 - plot choice: use histogram for distribution shape, location, dispersion, skewness, kurtosis, or modality questions; use scatter only for relationships or clusters
+- histogram data: provide a `values` list containing the literal raw observations to bin, including repeated values such as [5, 5, 5, 5, 4, 4, 3, 2, 2, 1]; never encode histogram bin centers and frequencies as x/y coordinates
+- runnable code: every code block must be complete, self-contained, valid Python that runs successfully as written; define all data and imports and use only packages present in the selected materials
 
 Return your response as a JSON object with this exact structure:
 {{
@@ -636,7 +720,8 @@ For a plot_interpretation question, replace plot_spec with:
     "title": "",
     "x_label": "x-axis label",
     "y_label": "y-axis label",
-    "groups": null
+    "groups": null,
+    "values": null
 }}
 
 Never use a plot title: the title may reveal the answer. For a clustering question, replace groups with one group identifier per point and use at least 30 points. For other plots, groups may be null.
@@ -672,6 +757,8 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
                 errors = validate_generated_quiz(batch_data, batch_plan)
                 errors.extend(_material_grounding_errors(batch_data, course_material))
                 errors.extend(_answer_exposure_errors(batch_data))
+                errors.extend(_code_execution_errors(batch_data))
+                errors.extend(_within_quiz_similarity_errors(batch_data, generated_questions))
                 errors.extend(_question_similarity_errors(batch_data, prior_question_prompts))
                 if not errors:
                     generated_questions.extend(batch_data["questions"])
@@ -703,16 +790,27 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
                 candidate_errors = validate_generated_quiz(candidate_data, single_plan)
                 candidate_errors.extend(_material_grounding_errors(candidate_data, course_material))
                 candidate_errors.extend(_answer_exposure_errors(candidate_data))
+                candidate_errors.extend(_code_execution_errors(candidate_data))
+                same_quiz_references = generated_questions + repaired_batch
+                candidate_errors.extend(_within_quiz_similarity_errors(candidate_data, same_quiz_references))
                 candidate_errors.extend(_question_similarity_errors(candidate_data, prior_question_prompts))
                 if candidate_errors:
+                    repair_references = [
+                        *prior_question_prompts,
+                        *(str(item.get("question", "")) for item in same_quiz_references),
+                    ]
                     candidate = _repair_question_with_llm(
                         client,
                         requirement,
                         candidate if isinstance(candidate, dict) else None,
                         course_material,
                         version_num,
-                        prior_question_prompts,
+                        repair_references,
                     )
+                    if _within_quiz_similarity_errors(
+                        {"questions": [candidate]}, same_quiz_references
+                    ):
+                        candidate = _build_safe_fallback_question(requirement)
                     if candidate.pop("_modality_fallback", None):
                         requirement["modality"] = "conceptual"
                     _normalize_generated_data(
@@ -725,6 +823,8 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
             repaired_errors = validate_generated_quiz(repaired_data, batch_plan)
             repaired_errors.extend(_material_grounding_errors(repaired_data, course_material))
             repaired_errors.extend(_answer_exposure_errors(repaired_data))
+            repaired_errors.extend(_code_execution_errors(repaired_data))
+            repaired_errors.extend(_within_quiz_similarity_errors(repaired_data, generated_questions))
             if repaired_errors:
                 batch_label = f"{expected_numbers[0]}-{expected_numbers[-1]}"
                 raise ValueError(
@@ -735,6 +835,7 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
 
     quiz_data = {"questions": generated_questions}
     errors = validate_generated_quiz(quiz_data, plan)
+    errors.extend(_within_quiz_similarity_errors(quiz_data))
     if errors:
         raise ValueError("Generated quiz violated its blueprint: " + "; ".join(errors))
 
@@ -787,7 +888,7 @@ def _write_plot_artifacts(quiz_data: Dict[str, Any], output_dir: Path, quiz_numb
             "    else:\n"
             "        ax.scatter(SPEC['x'], SPEC['y'])\n"
             "elif plot_type == 'histogram':\n"
-            "    ax.hist(SPEC['x'], bins='auto', edgecolor='black')\n"
+            "    ax.hist(SPEC.get('values', SPEC['x']), bins='auto', edgecolor='black')\n"
             "elif plot_type == 'bar':\n"
             "    ax.bar(SPEC['x'], SPEC['y'])\n"
             "else:\n"
@@ -1123,11 +1224,14 @@ def generate_quizzes(
         "",
         "## Assessment Blueprint",
         "",
-        "| # | Topic | Learning outcome | Type | Modality | Difficulty |",
-        "|---:|---|---|---|---|---|",
+        "| Version | # | Topic | Learning outcome | Type | Modality | Difficulty |",
+        "|---:|---:|---|---|---|---|---|",
         *[
-            f"| {slot.number} | {slot.topic} | {slot.learning_outcome.identifier}: {slot.learning_outcome.statement} | {slot.question_kind.value} | {slot.modality.value} | {slot.difficulty.value} |"
-            for slot in blueprint.slots
+            f"| {version} | {requirement['number']} | {requirement['topic']} | "
+            f"{requirement['learning_outcome']['identifier']}: {requirement['learning_outcome']['statement']} | "
+            f"{requirement['question_kind']} | {requirement['modality']} | {requirement['difficulty']} |"
+            for version in range(1, num_versions + 1)
+            for requirement in blueprint.version_plan(version)["requirements"]
         ],
         "",
         "## Output Files Generated",
