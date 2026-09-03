@@ -199,6 +199,43 @@ def test_prompt_cannot_name_its_short_correct_answer():
     ]
 
 
+def test_meta_answer_choice_is_rejected():
+    data = {"questions": [{
+        "number": 11,
+        "options": {
+            "A": "Signal is the structured pattern of interest.",
+            "B": "The concept should be interpreted using the definitions and examples in the selected course materials.",
+            "C": "Noise is the structured pattern.",
+            "D": "Signal is the largest value.",
+        },
+    }]}
+
+    assert generator_module._answer_quality_errors(data) == [
+        "question 11: option B is meta or non-substantive"
+    ]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "explain observations as a combination of signal and random noise.",
+        "identify Pandas, NumPy, and Matplotlib as tools for data manipulation, numerical computing, and visualization.",
+    ],
+)
+def test_known_multiple_select_fallbacks_have_two_substantive_answers(outcome):
+    question = generator_module._build_safe_fallback_question({
+        "number": 14,
+        "question_kind": "multiple_select",
+        "modality": "conceptual",
+        "topic": "Desc",
+        "learning_outcome": {"statement": outcome, "source": "MLO/01_Desc.md"},
+    })
+
+    assert len(question["correct_answers"]) == 2
+    assert generator_module._answer_quality_errors({"questions": [question]}) == []
+    assert all("selected course materials" not in option for option in question["options"].values())
+
+
 def test_similarity_repair_budget_falls_back_to_structurally_valid_question():
     requirement = {
         "number": 2,

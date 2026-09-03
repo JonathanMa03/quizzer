@@ -151,6 +151,8 @@ Unless the user requests otherwise:
 - answer choices must not be obviously absurd unless the learning goal specifically requires identifying an absurd option
 - answer choices must be grammatically parallel when possible
 - answer choices must avoid unnecessary trick wording
+- every answer choice must make a substantive, concept-specific claim that can be judged true or false from the assessed material
+- never use meta choices about the learning outcome, selected course materials, quiz construction, course administration, or how a concept "should be interpreted"
 
 For single-answer questions:
 

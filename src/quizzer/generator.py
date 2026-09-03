@@ -132,37 +132,77 @@ def _build_safe_fallback_question(requirement: Dict[str, Any]) -> Dict[str, Any]
         }
         answers = ["A", "B"] if is_multi else ["A"]
     elif "signal" in lowered and "noise" in lowered:
-        question = "Which statement best distinguishes signal from random noise in an observation?"
+        question = (
+            "Which statements correctly describe signal and noise in observed data? Select all that apply."
+            if is_multi else "Which statement best distinguishes signal from random noise in an observation?"
+        )
         options = {
-            "A": "Signal is the structured pattern; noise is unexplained random variation.",
-            "B": "Signal and noise are always identical.",
-            "C": "Noise is the structured pattern of interest.",
+            "A": "Signal is the structured pattern of interest.",
+            "B": "Random noise is unexplained variation around the structured pattern.",
+            "C": "Noise is the systematic relationship the analysis seeks to model.",
             "D": "Signal refers only to the largest observed value.",
         }
-        answers = ["A"]
+        answers = ["A", "B"] if is_multi else ["A"]
     elif any(term in lowered for term in ("mean", "median", "variance", "standard deviation", "skew")):
-        question = "Which statement about descriptive statistics is correct?"
+        question = (
+            "Which statements about descriptive statistics are correct? Select all that apply."
+            if is_multi else "Which statement about descriptive statistics is correct?"
+        )
         options = {
             "A": "The median is the middle value after observations are ordered.",
-            "B": "Variance measures the most frequent value.",
+            "B": "Standard deviation measures spread and is the square root of variance.",
             "C": "The mean is unaffected by extreme observations.",
             "D": "Standard deviation measures the location of the center only.",
         }
-        answers = ["A"]
-    elif "pandas" in lowered:
-        question = "Which task is Pandas primarily used for in the course workflow?"
+        answers = ["A", "B"] if is_multi else ["A"]
+    elif all(term in lowered for term in ("pandas", "numpy", "matplotlib")):
+        question = (
+            "Which library-to-task matches are correct? Select all that apply."
+            if is_multi else "Which library is primarily used to create data visualizations?"
+        )
         options = {
-            "A": "Loading and manipulating tabular data",
-            "B": "Defining database server permissions",
-            "C": "Training an unspecified classification algorithm",
-            "D": "Replacing all numerical computation",
+            "A": "Pandas — loading and manipulating tabular data",
+            "B": "NumPy — numerical array computation",
+            "C": "Matplotlib — loading relational database tables",
+            "D": "Pandas — rendering every type of statistical graphic",
         }
-        answers = ["A"]
+        answers = ["A", "B"] if is_multi else ["A"]
+        if not is_multi:
+            options = {"A": "Matplotlib", "B": "Pandas", "C": "NumPy", "D": "CSV"}
+    elif "pandas" in lowered:
+        question = (
+            "Which tasks are appropriate uses of Pandas? Select all that apply."
+            if is_multi else "Which task is Pandas primarily used for in the course workflow?"
+        )
+        options = {
+            "A": "Loading a CSV file into a table",
+            "B": "Selecting a named column from tabular data",
+            "C": "Replacing all numerical and plotting libraries",
+            "D": "Assigning labels with an unspecified learning algorithm",
+        }
+        answers = ["A", "B"] if is_multi else ["A"]
     elif "matplotlib" in lowered:
-        question = "Which task is Matplotlib primarily used for?"
-        options = {"A": "Creating data visualizations", "B": "Loading SQL tables", "C": "Computing array means", "D": "Assigning class labels"}
-        answers = ["A"]
+        question = (
+            "Which tasks can be performed with Matplotlib? Select all that apply."
+            if is_multi else "Which task is Matplotlib primarily used for?"
+        )
+        options = {"A": "Creating a scatterplot", "B": "Creating a histogram", "C": "Loading SQL tables", "D": "Computing an array mean"}
+        answers = ["A", "B"] if is_multi else ["A"]
     else:
+        if is_multi:
+            return {
+                "number": number,
+                "question_kind": "open_ended",
+                "modality": "conceptual",
+                "question": f"Explain this course concept and give a concrete example: {outcome}",
+                "options": None,
+                "correct_answers": [f"A complete answer accurately explains and exemplifies: {outcome}"],
+                "explanation": f"The response must accurately address this course concept: {outcome}",
+                "source_references": [source],
+                "plot_spec": None,
+                "_modality_fallback": "to_conceptual",
+                "_question_kind_fallback": "to_open_ended",
+            }
         question = f"Which statement best demonstrates this course concept: {outcome}"
         options = {
             "A": outcome,
@@ -171,9 +211,6 @@ def _build_safe_fallback_question(requirement: Dict[str, Any]) -> Dict[str, Any]
             "D": "The concept cannot be explained or applied.",
         }
         answers = ["A"]
-    if is_multi and len(answers) == 1:
-        options["B"] = "The concept should be interpreted using the definitions and examples in the selected course materials."
-        answers = ["A", "B"]
     return {
         "number": number,
         "question_kind": kind,
@@ -311,6 +348,31 @@ def _answer_exposure_errors(data: Dict[str, Any]) -> List[str]:
                     f"question {question.get('number')}: prompt exposes correct answer {letter}"
                 )
                 break
+    return errors
+
+
+def _answer_quality_errors(data: Dict[str, Any]) -> List[str]:
+    """Reject meta, process-oriented, or otherwise non-substantive choices."""
+    errors: List[str] = []
+    banned_patterns = (
+        r"selected course materials?",
+        r"supplied learning outcomes?",
+        r"course administration",
+        r"ignore(?:s|d|ing)? the (?:concepts|course material)",
+        r"correct response must",
+        r"cannot be explained or applied",
+        r"has no analytical content",
+    )
+    for question in data.get("questions", []):
+        options = question.get("options")
+        if not isinstance(options, dict):
+            continue
+        for letter, option in options.items():
+            text_value = str(option)
+            if any(re.search(pattern, text_value, re.IGNORECASE) for pattern in banned_patterns):
+                errors.append(
+                    f"question {question.get('number')}: option {letter} is meta or non-substantive"
+                )
     return errors
 
 
@@ -472,6 +534,7 @@ Respond only with JSON."""
         structural_errors = validate_generated_quiz(data, single_plan)
         structural_errors.extend(_material_grounding_errors(data, course_material))
         structural_errors.extend(_answer_exposure_errors(data))
+        structural_errors.extend(_answer_quality_errors(data))
         structural_errors.extend(_code_execution_errors(data))
         diversity_errors = _question_similarity_errors(data, prior_question_prompts or [])
         errors = structural_errors + diversity_errors
@@ -682,6 +745,7 @@ Assessment-modality rules:
 - code: include one short, self-contained fenced Markdown code block in the question prompt and ask for interpretation, prediction, or debugging; define every input value; answer choices must be prose or outputs rather than code; never emit literal \\n sequences, a one-backtick language block, answer-revealing comments, or answer-revealing names
 - plot_interpretation: provide a concrete, title-less plot_spec with numeric x and y values; ask students to interpret the generated plot, not an imagined plot or superficial labels/colors
 - grounding: make every question concrete and answerable by supplying a dataset, numerical values, code, formula, plot, result, or realistic decision scenario; avoid vague prompts that merely ask which abstract description is best
+- answer quality: every option must make a substantive claim about the assessed concept; never mention the learning outcome, course materials, quiz construction, course administration, or instructions for interpreting the concept in an answer choice
 - clustering plots: use at least 30 points arranged into at least two visually distinct groups and provide a groups array aligned with x and y so the structure cannot reasonably be mistaken for a regression trend
 - plot display: never include raw x/y values, coordinate pairs, a “Plot Points” section, or a data table in the student-facing question; the generated image is the only presentation of plot data
 - student solvability: every question must be answerable by inspection and reasonable hand calculation; never require executing code, reproducing pseudorandom output, fitting a model, or knowing an API/class not explicitly shown in the selected lecture notes
@@ -757,6 +821,7 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
                 errors = validate_generated_quiz(batch_data, batch_plan)
                 errors.extend(_material_grounding_errors(batch_data, course_material))
                 errors.extend(_answer_exposure_errors(batch_data))
+                errors.extend(_answer_quality_errors(batch_data))
                 errors.extend(_code_execution_errors(batch_data))
                 errors.extend(_within_quiz_similarity_errors(batch_data, generated_questions))
                 errors.extend(_question_similarity_errors(batch_data, prior_question_prompts))
@@ -790,6 +855,7 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
                 candidate_errors = validate_generated_quiz(candidate_data, single_plan)
                 candidate_errors.extend(_material_grounding_errors(candidate_data, course_material))
                 candidate_errors.extend(_answer_exposure_errors(candidate_data))
+                candidate_errors.extend(_answer_quality_errors(candidate_data))
                 candidate_errors.extend(_code_execution_errors(candidate_data))
                 same_quiz_references = generated_questions + repaired_batch
                 candidate_errors.extend(_within_quiz_similarity_errors(candidate_data, same_quiz_references))
@@ -813,6 +879,8 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
                         candidate = _build_safe_fallback_question(requirement)
                     if candidate.pop("_modality_fallback", None):
                         requirement["modality"] = "conceptual"
+                    if candidate.pop("_question_kind_fallback", None):
+                        requirement["question_kind"] = candidate["question_kind"]
                     _normalize_generated_data(
                         {"questions": [candidate]},
                         {"version": version_num, "requirements": [requirement]},
@@ -823,6 +891,7 @@ Respond ONLY with the JSON object, no additional text or markdown formatting."""
             repaired_errors = validate_generated_quiz(repaired_data, batch_plan)
             repaired_errors.extend(_material_grounding_errors(repaired_data, course_material))
             repaired_errors.extend(_answer_exposure_errors(repaired_data))
+            repaired_errors.extend(_answer_quality_errors(repaired_data))
             repaired_errors.extend(_code_execution_errors(repaired_data))
             repaired_errors.extend(_within_quiz_similarity_errors(repaired_data, generated_questions))
             if repaired_errors:
